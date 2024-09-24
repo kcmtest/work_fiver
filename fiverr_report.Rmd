@@ -1,0 +1,348 @@
+---
+title: "Report"
+output: html_document
+params:
+  filter_column: "Day"
+  filter_value: "Day_3"
+  #contrast_type: "High_vs_Low"
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r,include=FALSE}
+library(readr)
+library(tidyverse)
+library(DESeq2)
+library(EnhancedVolcano)
+library(PCAtools)
+
+
+combined_data <- read_tsv("combined_expression.tsv")
+countmatrix <- combined_data %>% column_to_rownames("target_id")
+#head(countmatrix)
+metadata <- read_tsv("meta_v4.txt")
+metadata <- metadata %>% column_to_rownames("Samples")
+#metadata$Intensity <- gsub(" ", "_", metadata$Intensity)
+#metadata$Day <- gsub(" ", "_", metadata$Day)
+countmatrix <- round(countmatrix, 0)
+counts <- countmatrix
+
+```
+
+
+
+```{r,include=FALSE}
+subset_data <- function(metadata, counts, filter_column, filter_value) {
+  # Validate filter_column
+  if (!(filter_column %in% colnames(metadata))) {
+    stop("Invalid 'filter_column' argument. Please use a valid column name from the metadata.")
+  }
+  
+  # Trim 
+  filter_value <- trimws(filter_value)
+  
+  # Subset 
+  filtered_metadata <- metadata[trimws(metadata[[filter_column]]) == filter_value, ]
+  
+  # Get sample names from the filtered metadata
+  sample_names_filtered <- rownames(filtered_metadata)
+  
+  # Subset counts data to include only the samples for the given filtered_metadata
+  counts_subset <- counts[, sample_names_filtered]
+  
+  return(list(metadata = filtered_metadata, counts = counts_subset))
+}
+```
+
+
+## Filter metadata 
+
+```{r,include=FALSE}
+filtered_meta_data <- subset_data(metadata, counts, params$filter_column, params$filter_value)
+class(filtered_meta_data)
+#dim(filtered_metadata)
+
+```
+
+
+## WALD TEST for pairwise condition
+
+```{r,include=FALSE}
+counts_subset <- filtered_meta_data$counts
+filtered_metadata <- filtered_meta_data$metadata
+
+# Convert Intensity to factor
+filtered_metadata$Intensity <- as.factor(filtered_metadata$Intensity)
+
+# Create DESeqDataSet
+dds <- DESeqDataSetFromMatrix(
+  countData = counts_subset,
+  colData = filtered_metadata,
+  design = ~ Intensity
+)
+
+dds <- DESeq(dds)
+
+# Define contrasts
+if (length(levels(filtered_metadata$Intensity)) == 3) {
+  contrasts <- list(
+    c("Intensity", "High", "Control"),
+    c("Intensity", "Low", "Control"),
+    c("Intensity", "High", "Low")
+  )
+} else {
+  stop("check metadata")
+}
+
+# Run DESeq2 analysis for each contrast
+results_list <- lapply(contrasts, function(contrast) {
+  results(dds, contrast = contrast)
+})
+
+
+```
+
+## Filter Significant Genes for Each Contrast
+
+
+```{r,include=FALSE}
+
+perform_comparison <- function(dds, contrasts, metadata, padj_threshold = 0.05, log2FC_threshold = 1) {
+  # Initialize an empty list to store significant results for each contrast
+  significant_results_list <- list()
+  
+  # Extract normalized counts from dds
+  normalized_counts <- as.data.frame(counts(dds, normalized=TRUE))
+  
+  # Loop through each contrast
+  for (i in seq_along(contrasts)) {
+    contrast <- contrasts[[i]]
+    contrast_name <- paste(contrast[2], "vs", contrast[3])
+    
+    # Subset normalized counts to only include relevant samples
+    sample_names <- rownames(metadata)[metadata$Intensity %in% c(contrast[2], contrast[3])]
+    normalized_counts_subset <- normalized_counts[, sample_names]
+    
+    # Extract the results for the comparison
+    results_comp <- results(dds, contrast = c("Intensity", contrast[2], contrast[3]))
+    
+    # Filter the results for significant genes
+    significant_results <- subset(results_comp, padj < padj_threshold & abs(log2FoldChange) > log2FC_threshold)
+    
+    # Merge with normalized counts
+    merged_results <- merge(as.data.frame(significant_results), normalized_counts_subset, by="row.names", sort=FALSE)
+    colnames(merged_results)[1] <- "GeneID"
+    
+    # Store the significant results in the list with a meaningful name
+    significant_results_list[[contrast_name]] <- merged_results
+  }
+  
+  return(significant_results_list)
+}
+
+
+
+
+## Save Results to Dynamic Folders
+
+# Create a function to save each data frame to a folder
+save_results_to_folder <- function(result_df, folder_name) {
+  # Create the folder if it doesn't exist
+  if (!dir.exists(folder_name)) {
+    dir.create(folder_name, recursive = TRUE)
+  }
+  
+  # Save the data frame to a CSV file
+  file_path <- file.path(folder_name, "significant_results.csv")
+  write.csv(result_df, file_path, row.names = FALSE)
+}
+
+# Perform comparison with normalized counts
+comparison_results <- perform_comparison(dds, contrasts,filtered_metadata)
+
+# Iterate over each contrast and save its results to a folder
+for (contrast_name in names(comparison_results)) {
+  # Extract the contrast name from the list name
+  contrast_name_clean <- gsub("`| vs ", "", contrast_name)
+  
+  # Create folder name
+  folder_name <- paste("results", contrast_name_clean, sep = "_")
+  
+  # Remove spaces and special characters from folder name
+  folder_name <- gsub("[^[:alnum:]]", "_", folder_name)
+  
+  # Save the data frame to the folder
+  save_results_to_folder(comparison_results[[contrast_name]], folder_name)
+}
+
+
+# Save normalised_value
+file_path <- "normalised_value.csv"
+normalised_value <- rlog(dds, blind=TRUE)
+normalised_value <- as.data.frame(assay(normalised_value)) %>% rownames_to_column('gene')
+write.csv(normalised_value, file_path, row.names = FALSE)
+
+```
+
+
+## Volcano plot
+
+```{r,echo=FALSE}
+plot_volcano <- function(res) {
+  EnhancedVolcano(
+    res,
+    lab = NA,
+    x = "log2FoldChange",
+    y = "pvalue"
+    )
+}
+
+
+```
+
+
+
+```{r,echo=FALSE}
+
+contrast_names <- names(comparison_results)
+print(contrast_names)
+filter_value <- params$filter_value
+
+for (contrast_name in contrast_names) {
+  
+  # Extract the contrast name from the list name
+  contrast_name_clean <- gsub("`| vs ", "", contrast_name)
+  
+  # Create folder name
+  folder_name <- paste("results", contrast_name_clean, sep = "_")
+  
+  # Read the significant results CSV
+  significant_results <- read.csv(file.path(folder_name, "significant_results.csv"), row.names = 1)
+  
+  # Check if log2FoldChange column is numeric and not empty
+  if ("log2FoldChange" %in% colnames(significant_results) && !any(is.na(significant_results$log2FoldChange)) && any(!is.na(significant_results$log2FoldChange))) {
+    # Plot the volcano plot
+    volcano_plot <- plot_volcano(significant_results)
+    
+    # Render the volcano plot in Markdown with caption
+    cat(paste("### Volcano plot for", contrast_name_clean, "(", filter_value, ")\n"))
+    print(volcano_plot)
+  } else {
+    cat(paste("Skipping contrast", contrast_name_clean, "due to empty or non-numeric log2FoldChange\n"))
+  }
+}
+
+
+
+```
+
+
+## PCA function
+
+```{r,echo=FALSE}
+plot_pca_biplot <- function(gene_expr, metadata, color_by = NULL) {
+  # Perform PCA
+  p <- pca(gene_expr, metadata = metadata, removeVar = 0.1, scale = TRUE)
+  
+  # Create biplot with specified size
+  biplot(
+    p,
+    lab = NULL,
+    colby = color_by, # Color based on metadata column
+    hline = 0,
+    gridlines.major = FALSE, 
+    gridlines.minor = FALSE,
+    pointSize = 5,
+    legendPosition = 'left', 
+    legendLabSize = 14, 
+    legendIconSize = 8.0,
+    drawConnectors = FALSE,
+    title = 'PCA bi-plot',
+    subtitle = 'PC1 versus PC2',
+    caption = 'PCs ≈ 80%'
+  )
+}
+
+
+```
+
+
+## PCA file process function
+
+```{r,echo=FALSE}
+
+# process_expression_and_metadata <- function(expression_file, filtered_metadata) {
+#   # Read expression data
+#   expression_df <- read_csv(expression_file) %>%
+#     column_to_rownames("GeneID") %>%
+#     select(-c(1:6))
+#   
+#   common_names <- intersect(row.names(filtered_metadata), names(expression_df))
+#   
+#   # Subset expression data and metadata
+#   expression_df_subset <- expression_df[, common_names]
+#   metadata_df_subset <- filtered_metadata[common_names, ]
+#   
+#   # Return subsetted expression data and metadata
+#   return(list(expression_data = expression_df_subset, meta_data = metadata_df_subset))
+# }
+# 
+# 
+
+```
+
+
+
+## PCA plot
+```{r,echo=FALSE}
+# contrast_names <- names(comparison_results)
+# print(contrast_names)
+# filter_value <- params$filter_value
+
+for (contrast_name in contrast_names) {
+  
+  # Extract the contrast name from the list name
+  contrast_name_clean <- gsub("`| vs ", "", contrast_name)
+  
+  # Extract the comparison result
+  comparison_result <- comparison_results[[contrast_name]]
+  
+  # Extract common row names between metadata and comparison result
+  common_names <- intersect(row.names(filtered_metadata), names(comparison_result))
+  
+  # Subset comparison result and metadata
+  expression_data <- comparison_result[, common_names]
+  meta_data <- filtered_metadata[common_names, ]
+  
+  pca_plot <- plot_pca_biplot(expression_data, meta_data,color_by = 'Intensity')
+
+  # Plot PCA biplot
+  cat(paste("### PCA biplot for", contrast_name_clean, "(", filter_value, ")\n"))
+  
+  # Check if expression data and metadata are not empty
+  if (nrow(expression_data) == 0 || nrow(meta_data) == 0) {
+    cat("Expression data or metadata is empty. Skipping plot generation.\n")
+  } else {
+    #plot_pca_biplot(expression_data, meta_data)
+    print(pca_plot)
+
+    cat("Plot generated successfully.\n")
+  }
+}
+
+
+
+
+```
+
+
+
+
+
+
+
+
